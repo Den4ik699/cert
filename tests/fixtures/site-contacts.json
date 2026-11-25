@@ -1,0 +1,54 @@
+{
+  "code": 200,
+  "message": "OK",
+  "data": [
+    {
+      "contactId": "c0000001-0000-4000-8000-000000000001",
+      "userId": "u0000001-0000-4000-8000-000000000001",
+      "firstName": { "en_US": "Jane" },
+      "lastName": { "en_US": "Doe" },
+      "title": "Site Manager",
+      "email": "jane.doe@example.com",
+      "mobile": "+1 555 020 0001",
+      "phone": "+1 555 010 0001",
+      "primary": true,
+      "twentyFourSevenContact": true
+    },
+    {
+      "contactId": "c0000002-0000-4000-8000-000000000002",
+      "userId": "u0000002-0000-4000-8000-000000000002",
+      "firstName": { "en_US": "John" },
+      "lastName": { "en_US": "Smith" },
+      "title": "Operator",
+      "email": "john.smith@example.com",
+      "mobile": "+1 555 020 0002",
+      "phone": "+1 555 010 0002",
+      "primary": false,
+      "twentyFourSevenContact": true
+    },
+    {
+      "contactId": "c0000003-0000-4000-8000-000000000003",
+      "userId": "u0000003-0000-4000-8000-000000000003",
+      "firstName": { "en_US": "Mary" },
+      "lastName": { "en_US": "Major" },
+      "title": "Engineer",
+      "email": "mary.major@example.com",
+      "mobile": "+1 555 020 0003",
+      "phone": "",
+      "primary": false,
+      "twentyFourSevenContact": false
+    },
+    {
+      "contactId": "c0000004-0000-4000-8000-000000000004",
+      "userId": "u0000004-0000-4000-8000-000000000004",
+      "firstName": { "en_US": "Alex" },
+      "lastName": { "en_US": "Kim" },
+      "title": "Technician",
+      "email": "alex.kim@example.com",
+      "mobile": "",
+      "phone": "+1 555 010 0004",
+      "primary": true,
+      "twentyFourSevenContact": false
+    }
+  ]
+}
