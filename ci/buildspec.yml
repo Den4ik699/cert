@@ -1,0 +1,103 @@
+version: 0.2
+
+env:
+  shell: bash
+  secrets-manager:
+    NPM_USERNAME: "<SECRET_NAME>:NPM_USERNAME"
+    NPM_API_KEY: "<SECRET_NAME>:NPM_API_KEY"
+
+phases:
+  install:
+    commands:
+      - n 22
+      - curl -fsSLO "https://releases.hashicorp.com/terraform/0.13.5/terraform_0.13.5_linux_amd64.zip"
+      - unzip terraform_0.13.5_linux_amd64.zip -d /usr/local/bin
+      - export ACTION=${ACTION:-apply}
+      - echo Action=$ACTION
+
+  pre_build:
+    commands:
+      - |
+        echo "======= Setting up .npmrc file"
+        cd client
+        AUTH_STRING=$(curl -u "$NPM_USERNAME":"$NPM_API_KEY" <INTERNAL_URL> | grep '^_auth' | awk -F'= ' '{print $2}')
+        npm config set @dsy:registry=<INTERNAL_URL>
+        npm config set @dsyui:registry=<INTERNAL_URL>
+        cat <<EOF > .npmrc
+        always-auth=true
+        //<INTERNAL_HOST>/:_auth=$AUTH_STRING
+        EOF
+        echo "======= Installing Client ======="
+        npm install && cd ..
+        echo "======= Installing API ======="
+        cd api && npm install --force && cd ..
+        echo "======= Installing DTO ======="
+        cd dto && npm install && cd ..
+        if [ "$ACTION" = "destroy" ]; then
+          echo "Destroying resources, installing API and Client dependencies only (no lint, no unit tests)"
+        else
+          echo "======= Installing Integration ======="
+          cd integration && npm install && cd ..
+          echo "======= Build, Lint and Run Unit Tests"
+          cd api &&  npm run test && npm run lint && cd ..
+          cd client && npm run lint && cd ..
+          cd integration && npm run lint && cd ..
+        fi
+
+  build:
+    commands:
+      - echo "======= Setting up environment ======="
+      - GIT_BRANCH=${GIT_BRANCH:-`scripts/branch-name`}
+      - export RES_PREFIX=`echo $GIT_BRANCH | sed -e 's/\//-/g'`
+      - export DOMAIN_PREFIX=`scripts/domain-prefix`
+      - export TF_FILE=${TF_FILE:-$RES_PREFIX/terraform.tfstate}
+      - echo Org Project     $ORG_PROJECT_NAME
+      - echo Org Env         $ORG_ENV
+      - echo TF State File   $TF_BUCKET/$TF_FILE
+      - echo GitBranch       $GIT_BRANCH
+      - echo ResourcePrefix  $RES_PREFIX
+      - echo DomainPrefix    $DOMAIN_PREFIX
+      - echo Action          $ACTION
+      - echo "======= Building app ======="
+      - npm run build
+      - touch app.zip
+      - echo "======= Deploying assets ======="
+      - cd manifests
+      - terraform init -backend=true -backend-config="bucket=$TF_BUCKET" -backend-config="key=$TF_FILE" -backend-config="region=us-west-2"
+      - terraform $ACTION -auto-approve -input=false -var-file=variables/$ORG_ENV.tfvars -var="domain_prefix=$DOMAIN_PREFIX" -var="resource_prefix=$ORG_PROJECT_NAME-$RES_PREFIX" -var="branch=$GIT_BRANCH" -refresh=true -lock=true -parallelism=2
+  post_build:
+    commands:
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" != "1" ]; then
+          echo "Build failed; skipping post-build steps."
+          exit 1
+        fi
+        echo Build completed on `date`
+        if [ "$ACTION" = "destroy" ]; then
+          echo "Destroy action; skipping integration tests."
+        else
+          echo "======= Integration tests ======="
+          export INTEGRATION_ENDPOINT=$(terraform output remote_url)
+          echo Integration Endpoint   $INTEGRATION_ENDPOINT
+          export MOCK_KEY=$(terraform output mock_key)
+          export ALLURE_BUCKET_NAME=$(terraform output allure_report_bucket)
+          cd ../integration
+          npm run cy:verify
+          npm run cy:info
+          TEST_FAILED=false
+          npm run test || TEST_FAILED=true
+          if [ "$TEST_FAILED" = true ]; then
+            echo "ALLURE_BUCKET_NAME is: $ALLURE_BUCKET_NAME"
+            echo ======= Generating Allure Report =======
+            npx allure generate --clean --single-file
+            echo ======= Deleting Old Allure Report =======
+            aws s3 rm s3://$ALLURE_BUCKET_NAME/${ORG_PROJECT_NAME}/${GIT_BRANCH}/ --recursive
+            echo ======= Uploading New Allure Report =======
+            aws s3 cp allure-report s3://$ALLURE_BUCKET_NAME/${ORG_PROJECT_NAME}/${GIT_BRANCH}/ --recursive
+            echo "Tests failed. Check the test report for more details"
+            exit 1
+          fi
+        fi
+cache:
+  paths:
+    - "terraform_0.13.5_linux_amd64.zip"

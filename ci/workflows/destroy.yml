@@ -1,0 +1,285 @@
+name: SOLO Destroy (Branch Teardown)
+
+###############################################################################
+# .github/workflows/destroy.yml — per-repo Destroy_Workflow (Flavor A)
+#
+# WHAT THIS IS:
+#   Copy this file into your repository at `.github/workflows/destroy.yml`.
+#   When a branch is DELETED, this workflow performs a strictly ordered
+#   two-step teardown of that branch's SOLO deployment:
+#     (a) an app-`destroy` CodeBuild build, waited to a terminal status, then
+#     (b) `terraform destroy` of the per-branch CodeBuild PROJECT DEFINITION
+#         (the `infra/codebuild-branch` module / "project-def" state layer),
+#         ONLY on a confirmed SUCCEEDED app-destroy.
+#   The heavy lifting lives in the shared composite action
+#   `.github/actions/codebuild-branch` (mode: destroy-and-cleanup); this
+#   workflow is only the trigger + the guards that decide whether to call it.
+#
+# SOURCE OF THE `delete` EVENT — PREREQUISITE:
+#   This workflow triggers on GitHub's `delete` event. The intended source of
+#   that event for merged feature branches is the repository's
+#   "Automatically delete head branches" setting
+#   (Settings → General → Pull Requests → "Automatically delete head branches").
+#   With that enabled, merging a PR deletes the head branch, which emits a
+#   `delete` event that fires this workflow.
+#
+#   IMPORTANT: this workflow NEVER treats a PR-merge event itself as a destroy
+#   trigger. There is no `pull_request` trigger here; the only trigger is
+#   `delete`. Teardown happens strictly in response to a branch actually being
+#   deleted, not to a merge (Req 4.3, 4.5).
+#
+# LOCAL-ACTION-PATH / SHARED-ORG REPOINT:
+#   The `uses: ./.github/actions/codebuild-branch` reference below is a LOCAL
+#   path, so the composite action must exist in THIS repository (checked out
+#   below). If you centralize the action in a shared org repo instead, repoint
+#   this to `<ORG>/<repo>/.github/actions/codebuild-branch@<ref>` (replace
+#   the `<repo>`/`<ref>` with the real shared repo under the <ORG> org + a
+#   pinned ref).
+#
+# Requirements traceability: 4.1, 4.2, 4.3, 4.5, 4.6, 5.1, 5.2, 5.3, 5.4, 5.5,
+#                            6.1, 6.2, 6.3, 6.4, 6.5, 9.4, 11.6, 11.7
+###############################################################################
+
+on:
+  delete:
+
+# OIDC: id-token: write lets the composite action assume the per-env role via
+# OIDC (no long-lived credentials); contents: read is for the checkout below.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Single teardown job.
+  #
+  # STEP 1 — ref_type guard (Req 4.1, 4.2): gate the WHOLE job on
+  # `github.event.ref_type == 'branch'`. For a TAG deletion this job is skipped
+  # entirely, so the run concludes SUCCESS without starting any build or
+  # touching any state — a tag delete is a no-op success.
+  # ---------------------------------------------------------------------------
+  destroy:
+    if: github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    steps:
+      # The deleted branch is gone, so we cannot check it out. Check out a
+      # STABLE default branch to read `.github/solo-deploy.yml` and to provide
+      # the local composite action + `infra/codebuild-branch` module.
+      # Adjust `ref` if your repo's default long-lived branch is not `dev`
+      # (e.g. use `master`/your repo default).
+      - name: Checkout config + action from default branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev  # deleted branch no longer exists; read from a stable branch
+
+      # -----------------------------------------------------------------------
+      # STEP 2 — Protected-branch guard (Req 6.1–6.5). Mirrors
+      # src/protected-branch.js exactly:
+      #   - protected_branches ABSENT or EMPTY -> default dev/preprd/master
+      #     (Req 6.2).
+      #   - protected_branches PRESENT but NOT a list of strings (scalar, map,
+      #     or a sequence with a non-string entry) -> REJECT the config: FAIL
+      #     the step, run NO destroy (Req 6.4). This matches
+      #     resolveProtectedList() throwing on a non-list-of-strings.
+      #   - Compare the DELETED branch (github.event.ref) against the list
+      #     TRIMMED + CASE-INSENSITIVE, exact match (Req 6.1, 6.3), mirroring
+      #     normalize()/matchesProtectedList().
+      #   - When protected: SKIP destroy, log the skipped branch + the
+      #     "protected-branch exclusion" reason, and conclude SUCCESS leaving
+      #     the project and BOTH state layers unchanged (Req 6.5).
+      #
+      # STEP 3 — Prod/protected safety (Req 9.4): `master` (the prod branch) is
+      # in the DEFAULT protected list, so the protected-branch guard above
+      # already blocks any automated destroy of prod/master. We additionally
+      # assert below that a resolved `prod` environment is NEVER auto-destroyed
+      # through this path, as a defense-in-depth backstop even if a repo's
+      # protected list were customized to drop `master`.
+      # -----------------------------------------------------------------------
+      - name: Protected-branch guard
+        id: guard
+        env:
+          DELETED_BRANCH: ${{ github.event.ref }}
+        run: |
+          set -euo pipefail
+
+          CONFIG=".github/solo-deploy.yml"
+          if [ ! -f "$CONFIG" ]; then
+            echo "::error::Deploy config $CONFIG not found; cannot evaluate protected branches." >&2
+            exit 1
+          fi
+
+          # Trim (leading/trailing whitespace) + lowercase — matches
+          # normalize() in src/protected-branch.js (String(v).trim().toLowerCase()).
+          norm() {
+            printf '%s' "$1" \
+              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+              | tr '[:upper:]' '[:lower:]'
+          }
+
+          # YAML node type of protected_branches:
+          #   !!null -> key absent or explicit null  (=> default list, Req 6.2)
+          #   !!seq  -> a list (entries validated below)
+          #   other  -> scalar/map/etc. => NOT a list of strings (=> reject, Req 6.4)
+          NODE_TYPE="$(yq '.protected_branches | tag' "$CONFIG")"
+
+          USE_DEFAULT=false
+          case "$NODE_TYPE" in
+            '!!null')
+              # Absent/null -> default dev/preprd/master (Req 6.2).
+              USE_DEFAULT=true
+              ;;
+            '!!seq')
+              # A sequence: reject if ANY entry is not a scalar string, i.e. not
+              # a list of strings (mirrors the typeof !== "string" rejection in
+              # resolveProtectedList()) (Req 6.4).
+              NON_STR="$(yq '[.protected_branches[] | select(tag != "!!str")] | length' "$CONFIG")"
+              if [ "${NON_STR:-0}" != "0" ]; then
+                echo "::error::Invalid 'protected_branches' in $CONFIG: expected a list of strings. Refusing to start a destroy build." >&2
+                exit 1
+              fi
+              COUNT="$(yq '.protected_branches | length' "$CONFIG")"
+              if [ "${COUNT:-0}" = "0" ]; then
+                # Empty list -> default dev/preprd/master (Req 6.2).
+                USE_DEFAULT=true
+              fi
+              ;;
+            *)
+              # Scalar, map, or anything that is not a sequence -> reject (Req 6.4).
+              echo "::error::Invalid 'protected_branches' in $CONFIG: expected a list of strings but found type '$NODE_TYPE'. Refusing to start a destroy build." >&2
+              exit 1
+              ;;
+          esac
+
+          # Build the effective protected list (newline-separated).
+          if [ "$USE_DEFAULT" = "true" ]; then
+            PROTECTED_RAW=$'dev\npreprd\nmaster'
+            echo "protected_branches absent or empty; defaulting to: dev, preprd, master"
+          else
+            PROTECTED_RAW="$(yq -r '.protected_branches[]' "$CONFIG")"
+          fi
+
+          DELETED_NORM="$(norm "$DELETED_BRANCH")"
+
+          IS_PROTECTED=false
+          while IFS= read -r entry; do
+            # Skip blank lines that can arise from trimming.
+            [ -z "${entry//[[:space:]]/}" ] && continue
+            if [ "$(norm "$entry")" = "$DELETED_NORM" ]; then
+              IS_PROTECTED=true
+              break
+            fi
+          done <<< "$PROTECTED_RAW"
+
+          if [ "$IS_PROTECTED" = "true" ]; then
+            # Skip destroy; leave project + BOTH state layers unchanged; log
+            # the skipped branch + reason; conclude success (Req 6.1, 6.5).
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping destroy for branch '$DELETED_BRANCH': protected-branch exclusion. Project and both state layers left unchanged."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Branch '$DELETED_BRANCH' is not protected; proceeding to read config."
+          fi
+
+      # -----------------------------------------------------------------------
+      # STEP 3/4 — Derive environment, read region + the per-env role_arn.
+      #
+      # ENV DERIVATION (matches the .github/solo-deploy.yml contract and
+      # envName() in the JS): preprd -> preprd, master -> prod, else dev.
+      # We derive env FROM THE DELETED BRANCH and read environments.<env>.role_arn
+      # (per the design's branch-derived env for destroy).
+      #
+      # PROD SAFETY (Req 9.4): if the derived env is `prod` (i.e. master),
+      # we FAIL here with no destroy. In normal config `master` is already
+      # caught by the protected-branch guard above; this is a defense-in-depth
+      # backstop so prod is NEVER auto-destroyed through this path even if a
+      # repo dropped `master` from its protected list.
+      #
+      # FAIL (no destroy) when region or the resolved role_arn is missing (the
+      # composite action is not called) (Req 11.6, 11.7).
+      # -----------------------------------------------------------------------
+      - name: Resolve environment and read deployment config
+        id: config
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          DELETED_BRANCH: ${{ github.event.ref }}
+        run: |
+          set -euo pipefail
+
+          CONFIG=".github/solo-deploy.yml"
+          if [ ! -f "$CONFIG" ]; then
+            echo "::error::Deploy config $CONFIG not found; cannot destroy." >&2
+            exit 1
+          fi
+
+          # Derive environment from the deleted branch (trim + lowercase first).
+          BRANCH_NORM="$(printf '%s' "$DELETED_BRANCH" \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+            | tr '[:upper:]' '[:lower:]')"
+          case "$BRANCH_NORM" in
+            preprd)         ENVIRONMENT="preprd" ;;
+            master)         ENVIRONMENT="prod" ;;
+            *)              ENVIRONMENT="dev" ;;
+          esac
+          echo "Derived environment '$ENVIRONMENT' from deleted branch '$DELETED_BRANCH'."
+
+          # PROD SAFETY (Req 9.4): never auto-destroy prod through this path.
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            echo "::error::Refusing to auto-destroy the 'prod' environment (branch '$DELETED_BRANCH'). Production is never torn down by the Destroy_Workflow." >&2
+            exit 1
+          fi
+
+          # `// ""` makes yq emit an empty string for absent/null so the guards fire.
+          REGION="$(yq -r '.region // ""' "$CONFIG")"
+          if [ -z "$REGION" ] || [ "$REGION" = "null" ]; then
+            echo "::error::Missing 'region' in $CONFIG; cannot destroy. Not calling the composite action." >&2
+            exit 1
+          fi
+          # Validate region against the documented allowlist (mirrors the build
+          # workflow + the solo-deploy.yml contract: exactly us-west-2). An
+          # invalid region fails HERE, before the composite
+          # action performs any AWS operation (Req 11.6).
+          if [ "$REGION" != "us-west-2" ]; then
+            echo "::error::Deploy config region '$REGION' is invalid; expected us-west-2. Not calling the composite action." >&2
+            exit 1
+          fi
+
+          ROLE_ARN="$(yq -r ".environments.${ENVIRONMENT}.role_arn // \"\"" "$CONFIG")"
+          if [ -z "$ROLE_ARN" ] || [ "$ROLE_ARN" = "null" ]; then
+            echo "::error::Missing 'environments.${ENVIRONMENT}.role_arn' in $CONFIG; cannot destroy. Not calling the composite action." >&2
+            exit 1
+          fi
+
+          {
+            echo "environment=$ENVIRONMENT"
+            echo "region=$REGION"
+            echo "role_arn=$ROLE_ARN"
+          } >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # STEP 5 — Ordered two-step teardown via the shared composite action
+      # (mode: destroy-and-cleanup). The action performs, in order:
+      #   (a) project-existence guard: if the project-def state tracks no
+      #       resources -> no-op SUCCESS with no AWS/state change (Req 4.6);
+      #   (b) an app-`destroy` CodeBuild build, polled to a TERMINAL status
+      #       (Req 5.1);
+      #   (c) `terraform destroy` of the project-def module ONLY on a confirmed
+      #       SUCCEEDED (Req 5.2, 5.5); on any non-success or unconfirmable
+      #       status it does NOT destroy — retaining the project + BOTH state
+      #       layers and failing (Req 5.3, 5.4).
+      #
+      # Only runs when the branch is not protected and the config is valid.
+      # LOCAL action path — repoint to the <ORG> org if the action is
+      # centralized (see the header note).
+      # -----------------------------------------------------------------------
+      - name: Destroy and cleanup
+        if: steps.guard.outputs.skip == 'false'
+        uses: ./.github/actions/codebuild-branch
+        with:
+          mode: destroy-and-cleanup
+          aws_region: ${{ steps.config.outputs.region }}
+          role_arn: ${{ steps.config.outputs.role_arn }}
+          repo_name: ${{ github.event.repository.name }}
+          branch_name: ${{ github.event.ref }}
+          login: ${{ github.repository_owner }}
+          environment: ${{ steps.config.outputs.environment }}
+          repo_url: ${{ github.event.repository.clone_url }}

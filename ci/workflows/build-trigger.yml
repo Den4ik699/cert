@@ -1,0 +1,265 @@
+###############################################################################
+# .github/workflows/build-trigger.yml
+#
+# Per-repo Build_Trigger_Workflow (SOLO GitHub Actions migration, Flavor A).
+#
+# WHAT THIS IS:
+#   Copy this file into a repository at `.github/workflows/build-trigger.yml`
+#   alongside `.github/solo-deploy.yml` (the Deploy_Config) and the composite
+#   action at `.github/actions/codebuild-branch/action.yml`.
+#
+#   On branch push it ensures the branch's per-branch CodeBuild project
+#   exists (by `terraform apply` of the `infra/codebuild-branch` module) and then
+#   starts an `apply` build against the pushed source. GitHub Actions is only the
+#   TRIGGER: CodeBuild still runs the unchanged `buildspec.yml`. (Requirements 2, 3.)
+#
+#   workflow_dispatch is supported for MANUAL runs, but is production-safe: a
+#   manual run never defaults to prod, and targeting prod/master requires an
+#   explicit confirmation input AND passes through the `prod` GitHub Environment
+#   (required-reviewer approval). (Requirement 9.)
+#
+# LOCAL-ACTION-PATH REPOINT:
+#   This template calls the composite action by LOCAL path
+#   (`./.github/actions/codebuild-branch`). That path must exist in the repo the
+#   template is dropped into (the SOLO package ships it, together with the
+#   `infra/codebuild-branch` module the action runs `terraform -chdir=` against).
+#   To use a single shared org action instead, repoint the `uses:` below to e.g.
+#   `<ORG>/queue/.github/actions/codebuild-branch@<ref>` and drop the local copy.
+#
+# PROD GITHUB ENVIRONMENT SETUP:
+#   For the prod safety gate to add human approval, create a GitHub Environment
+#   named `prod` in the repo settings with "Required reviewers" enabled. The
+#   deploy job binds `environment: prod` when the target is prod, so the run
+#   pauses for approval before the module apply / build start.
+#
+# Requirements traceability: 2.1, 2.2, 2.3, 3.1, 3.2, 9.1, 9.2, 9.3, 9.5,
+#                            11.3, 11.4, 11.5, 11.6, 11.7
+###############################################################################
+name: SOLO Build Trigger
+
+on:
+  # push.branches: '**' covers BOTH new-branch creation and subsequent pushes,
+  # so an explicit `create:` event is redundant and is intentionally omitted:
+  #   - a branch created by pushing already fires push (duplicate-run risk), and
+  #   - an unfiltered `create:` ALSO fires for TAGS, which would wrongly provision
+  #     a dev CodeBuild project and start a build for the tag name (Req 2.1-2.3, 3.1, 3.2).
+  push:
+    branches: ['**']   # every branch push: provisions on first push, builds on every push
+  workflow_dispatch:   # manual runs — production-safe (Req 9)
+    inputs:
+      # Manual runs must NEVER default to prod (Req 9.1). Selecting prod here is
+      # only honored together with confirm_production=true (Req 9.2, 9.5).
+      environment:
+        description: "Target environment for a manual run (never defaults to prod)."
+        type: choice
+        required: false
+        default: dev
+        options:
+          - dev
+          - preprd
+          - prod
+      # Explicit, deliberate production confirmation. Without it, a manual run
+      # that resolves to prod terminates before any AWS op (Req 9.2, 9.5).
+      confirm_production:
+        description: "Set true to confirm a deliberate PRODUCTION run. Required when targeting prod/master."
+        type: boolean
+        required: false
+        default: false
+
+# OIDC needs id-token: write; actions/checkout needs contents: read.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # resolve — checkout, validate Deploy_Config, derive environment/role, and run
+  # the manual-run production-safety gate. Everything here happens BEFORE any AWS
+  # operation, so an invalid region, a missing env role, an empty branch, or an
+  # unconfirmed prod manual run all halt the workflow before role assumption,
+  # module apply, or build start (Req 11.6, 11.7, 2.5, 9.2, 9.5).
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      region: ${{ steps.config.outputs.region }}
+      environment: ${{ steps.derive.outputs.environment }}
+      role_arn: ${{ steps.role.outputs.role_arn }}
+      branch: ${{ steps.derive.outputs.branch }}
+      # GitHub Environment to bind on the deploy job: `prod` when targeting prod
+      # (so required-reviewer protection applies), empty otherwise.
+      gh_environment: ${{ steps.derive.outputs.gh_environment }}
+    steps:
+      # STEP 1 — checkout so we can read .github/solo-deploy.yml and so the
+      # infra/codebuild-branch module tree is present for the composite action's
+      # `terraform -chdir=infra/codebuild-branch`.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # STEP 2 — read + validate region from Deploy_Config with yq. Fail BEFORE
+      # any AWS op if region is absent or not exactly us-west-2
+      # (Req 11.1, 11.3, 11.4, 11.5, 11.6).
+      - name: Load and validate region
+        id: config
+        shell: bash
+        env:
+          CONFIG_FILE: .github/solo-deploy.yml
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$CONFIG_FILE" ]]; then
+            echo "::error::Deploy_Config '$CONFIG_FILE' is absent; cannot resolve region." >&2
+            exit 1
+          fi
+
+          region="$(yq -r '.region // ""' "$CONFIG_FILE")"
+          if [[ -z "$region" || "$region" == "null" ]]; then
+            echo "::error::Deploy_Config declares no region; expected us-west-2." >&2
+            exit 1
+          fi
+          if [[ "$region" != "us-west-2" ]]; then
+            echo "::error::Deploy_Config region '$region' is invalid; expected us-west-2." >&2
+            exit 1
+          fi
+
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+          echo "Validated region: $region"
+
+      # STEP 3 — derive the branch and environment, then run the prod-safety gate.
+      #
+      # Branch env derivation (matches the design's branch-derivation for the
+      # WORKFLOW's env selection):
+      #   preprd        -> preprd
+      #   master        -> prod
+      #   everything else -> dev
+      # (Only exact `master` maps to prod; `main` is not used in this org.)
+      #
+      # For manual (workflow_dispatch) runs the operator-selected `environment`
+      # input takes precedence, but still never silently lands on prod: a prod
+      # target (whether selected or branch-derived to master) requires
+      # confirm_production=true, otherwise the run terminates here BEFORE any AWS
+      # operation (Req 9.1, 9.2, 9.5).
+      - name: Derive environment and enforce production safety
+        id: derive
+        shell: bash
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENVIRONMENT: ${{ github.event.inputs.environment }}
+          CONFIRM_PRODUCTION: ${{ github.event.inputs.confirm_production }}
+        run: |
+          set -euo pipefail
+
+          # Validate the branch is non-empty / non-whitespace (Req 2.5).
+          branch="$(printf '%s' "${BRANCH_NAME:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [[ -z "$branch" ]]; then
+            echo "::error::Invalid branch name: empty or whitespace-only." >&2
+            exit 1
+          fi
+
+          # Branch-derived environment.
+          case "$branch" in
+            preprd)        branch_env="preprd" ;;
+            master)        branch_env="prod" ;;
+            *)             branch_env="dev" ;;
+          esac
+
+          # Manual runs: the selected input environment takes precedence (and
+          # defaults to dev — never prod, Req 9.1). Push events use the branch
+          # derivation.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            environment="${INPUT_ENVIRONMENT:-dev}"
+          else
+            environment="$branch_env"
+          fi
+
+          # Determine whether this run targets production. A manual run is a prod
+          # target if the operator selected prod OR the branch is master.
+          is_prod="false"
+          if [[ "$environment" == "prod" || "$branch_env" == "prod" ]]; then
+            is_prod="true"
+          fi
+
+          # Production-safety gate — applies ONLY to manual (workflow_dispatch)
+          # runs. Push events to master still deploy prod normally: they
+          # are not the manual-run risk (Req 9.2). A manual prod target without
+          # explicit confirmation terminates BEFORE any AWS operation (Req 9.5).
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$is_prod" == "true" ]]; then
+            if [[ "$CONFIRM_PRODUCTION" != "true" ]]; then
+              echo "::error::Manual run targets PRODUCTION (environment=$environment, branch=$branch) but confirm_production was not set to true. Explicit production confirmation is required; terminating before any AWS operation." >&2
+              exit 1
+            fi
+            # Confirmed prod manual run: force the environment to prod so the
+            # deploy job assumes the prod role and binds the prod Environment.
+            environment="prod"
+            is_prod="true"
+          fi
+
+          # Bind the `prod` GitHub Environment on the deploy job whenever the
+          # target is prod, so required-reviewer approval applies (Req 9.3).
+          gh_environment=""
+          if [[ "$is_prod" == "true" ]]; then
+            gh_environment="prod"
+          fi
+
+          {
+            echo "branch=$branch"
+            echo "environment=$environment"
+            echo "gh_environment=$gh_environment"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved branch='$branch' environment='$environment' (prod=$is_prod)"
+
+      # STEP 4 — read the env->role_arn mapping from Deploy_Config. Fail BEFORE
+      # any AWS op if the selected environment has no role ARN (Req 11.7).
+      - name: Resolve environment role ARN
+        id: role
+        shell: bash
+        env:
+          CONFIG_FILE: .github/solo-deploy.yml
+          ENVIRONMENT: ${{ steps.derive.outputs.environment }}
+        run: |
+          set -euo pipefail
+
+          role_arn="$(yq -r ".environments.\"${ENVIRONMENT}\".role_arn // \"\"" "$CONFIG_FILE")"
+          if [[ -z "$role_arn" || "$role_arn" == "null" ]]; then
+            echo "::error::Deploy_Config has no role_arn for environment '$ENVIRONMENT'; halting before AWS role assumption." >&2
+            exit 1
+          fi
+
+          echo "role_arn=$role_arn" >> "$GITHUB_OUTPUT"
+          echo "Resolved role ARN for environment '$ENVIRONMENT'."
+
+  # ---------------------------------------------------------------------------
+  # deploy — OIDC auth + `terraform apply` of the codebuild-branch module +
+  # `start-build`, all inside the composite action. Bound to the `prod` GitHub
+  # Environment only when the target is prod, so required-reviewer approval
+  # gates production (Req 9.3). Needs `resolve` so validation and the prod gate
+  # always run first; if `resolve` fails, no AWS operation ever happens.
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Empty string => no environment binding for non-prod; `prod` => the
+    # protected GitHub Environment (required reviewers). See PROD ENVIRONMENT
+    # SETUP note in the header.
+    environment: ${{ needs.resolve.outputs.gh_environment }}
+    steps:
+      # Re-checkout: this is a separate job/runner and needs the repo tree
+      # (Deploy_Config + infra/codebuild-branch module) for the composite action.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Composite action: OIDC -> terraform init/apply (project-def layer) ->
+      # aws codebuild start-build. LOCAL PATH — see LOCAL-ACTION-PATH REPOINT in
+      # the header to switch to a shared org action.
+      - name: Ensure project and start build
+        uses: ./.github/actions/codebuild-branch
+        with:
+          mode: ensure-and-build
+          aws_region: ${{ needs.resolve.outputs.region }}
+          role_arn: ${{ needs.resolve.outputs.role_arn }}
+          repo_name: ${{ github.event.repository.name }}
+          branch_name: ${{ needs.resolve.outputs.branch }}
+          login: ${{ github.repository_owner }}
+          environment: ${{ needs.resolve.outputs.environment }}
+          repo_url: ${{ github.event.repository.clone_url }}
